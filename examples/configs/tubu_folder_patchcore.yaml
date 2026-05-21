@@ -1,0 +1,49 @@
+model:
+  class_path: anomalib.models.Patchcore
+  init_args:
+    backbone: wide_resnet50_2
+    layers:
+      - layer2
+      - layer3
+    pre_trained: true
+    coreset_sampling_ratio: 0.1
+    visualizer:
+      class_path: anomalib.visualization.ImageVisualizer
+      init_args:
+        output_dir: "results/tubu_patchcore/images"
+
+data:
+  class_path: anomalib.data.Folder
+  init_args:
+    name: tubu_loujinshu
+    root: "D:/Min/Projects/VSCodeProjects/dataset/TB"
+    normal_dir: "OK"
+    abnormal_dir: "LJS"
+    normal_test_dir: null
+    mask_dir: "masks"
+    extensions: [".bmp", ".jpg", ".png"]
+    train_batch_size: 8
+    eval_batch_size: 8
+    num_workers: 0
+    test_split_mode: from_dir
+    test_split_ratio: 0.2
+    val_split_mode: same_as_test
+    val_split_ratio: 0.5
+    seed: 42
+
+trainer:
+  max_epochs: 1
+  accelerator: gpu
+  devices: 1
+  default_root_dir: "results/tubu_patchcore"
+  plugins:
+    - class_path: anomalib.utils.checkpoint_io.FileCheckpointIO
+  callbacks:
+    - class_path: anomalib.callbacks.ModelCheckpoint
+      init_args:
+        dirpath: "results/tubu_patchcore/weights/lightning"
+        filename: "model"
+        auto_insert_metric_name: false
+        save_last: true
+        save_top_k: 0
+        save_weights_only: true

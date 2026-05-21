@@ -1,0 +1,40 @@
+# Anomalib 配置 - 涂布缺陷检测 Demo
+# 使用 Patchcore 模型（无需训练，速度极快）+ Folder 数据集
+
+model:
+  class_path: anomalib.models.Patchcore
+  init_args:
+    input_size: [256, 256]
+    backbone: wide_resnet50_2
+    layers:
+      - layer2
+      - layer3
+    coreset_sampling_ratio: 0.01
+
+data:
+  class_path: anomalib.data.Folder
+  init_args:
+    name: tubu_loujinshu
+    root: "D:/Min/Projects/VSCodeProjects/dataset/TB"
+    normal_dir: "OK"
+    abnormal_dir: "LJS"
+    normal_test_dir: null
+    mask_dir: "masks"
+    extensions: [".bmp", ".jpg", ".png"]
+    train_batch_size: 32
+    eval_batch_size: 32
+    num_workers: 4
+    test_split_mode: from_dir
+    test_split_ratio: 0.2
+    val_split_mode: same_as_test
+    val_split_ratio: 0.5
+    seed: 42
+
+trainer:
+  max_epochs: 1
+  accelerator: auto
+  devices: 1
+  gradient_clip_val: 0.0
+  limit_train_batches: -1
+  limit_val_batches: -1
+  limit_test_batches: -1
