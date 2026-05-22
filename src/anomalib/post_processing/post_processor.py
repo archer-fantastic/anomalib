@@ -134,13 +134,16 @@ class PostProcessor(nn.Module, Callback):
         """
         del trainer, pl_module
         if self.enable_thresholding:
-            # compute threshold values
+            # compute threshold values（统一在 CPU 上计算，避免 GPU argsort OOM）
             if self._image_threshold_metric.update_called:
-                self._image_threshold.copy_(self._image_threshold_metric.compute())
-                self._image_threshold_metric.reset()
+                _m = self._image_threshold_metric.cpu()
+                self._image_threshold.copy_(_m.compute())
+                _m.reset()
             if self._pixel_threshold_metric.update_called:
-                self._pixel_threshold.copy_(self._pixel_threshold_metric.compute())
-                self._pixel_threshold_metric.reset()
+                _m = self._pixel_threshold_metric.cpu()
+                _thresh = _m.compute()
+                _m.reset()
+                self._pixel_threshold.copy_(_thresh.to(self._pixel_threshold.device))
         if self.enable_normalization:
             # compute normalization values
             if self._image_min_max_metric.update_called:

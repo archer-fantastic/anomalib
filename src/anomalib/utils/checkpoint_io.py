@@ -21,9 +21,11 @@ class FileCheckpointIO(CheckpointIO):
             if tmp_path.exists():
                 tmp_path.unlink(missing_ok=True)
 
-    def load_checkpoint(self, path: str | Path, map_location: Any = None) -> dict[str, Any]:
+    def load_checkpoint(self, path: str | Path, map_location: Any = None,
+                         weights_only: bool | None = None) -> dict[str, Any]:
+        del weights_only  # anomalib checkpoint 包含模型+优化器状态，不能仅加载权重
         path = Path(path)
-        return torch.load(path, map_location=map_location)
+        return torch.load(path, map_location=map_location, weights_only=False)
 
     def remove_checkpoint(self, path: str | Path) -> None:
         Path(path).unlink(missing_ok=True)

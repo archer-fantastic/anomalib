@@ -86,7 +86,7 @@ def list_available() -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="下载 timm 预训练权重到 weights/")
-    parser.add_argument("--model", type=str, default="wide_resnet50_2",
+    parser.add_argument("--model", type=str, default="wide_resnet101_2",
                         help="timm 模型名称 (默认: wide_resnet50_2)")
     parser.add_argument("--output-dir", type=str, default=None,
                         help="输出目录 (默认: weights/)")

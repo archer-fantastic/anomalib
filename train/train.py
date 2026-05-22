@@ -180,6 +180,8 @@ def main(args: argparse.Namespace | None = None) -> None:
     log.info(f"  image_size          : {args.image_size}")
     log.info(f"  max_epochs          : {args.max_epochs} "
              f"({'特征建库' if args.max_epochs == 1 else '梯度训练'})")
+    _use_fp16 = args.model in ("simplenet", "rd")
+    log.info(f"  precision           : {'FP16 (混合精度)' if _use_fp16 else 'FP32 (Memory Bank 方法无需梯度)'}")
 
     # ---- 预训练权重加载（返回 backbone_arg 或 None）----
     backbone_arg = _load_backbone_weights(args, log)
@@ -196,12 +198,16 @@ def main(args: argparse.Namespace | None = None) -> None:
         save_weights_only=args.save_weights_only,
     )
 
+    # Memory Bank 方法（patchcore/padim）无梯度计算，不能开 FP16
+    # 训练式方法（simplenet/rd）需要梯度，开 FP16 节省显存
+    use_fp16 = args.model in ("simplenet", "rd")
     engine = Engine(
         callbacks=[checkpoint_callback],
         default_root_dir=results_root,
         accelerator=args.accelerator,
         devices=args.devices,
         max_epochs=args.max_epochs,
+        precision="16-mixed" if use_fp16 else "32",
         plugins=[FileCheckpointIO()],
     )
 
@@ -341,25 +347,25 @@ def _sample_and_predict(model, engine, ckpt_path: Path, dataset_root: Path,
 # ================================================================
 _MODEL_DEFAULTS = {
     "patchcore": {
-        "backbone":   "wide_resnet50_2",
+        "backbone":   "resnet18",
         "layers":     ["layer2", "layer3"],
         "max_epochs": 1,       # Memory Bank 方法，不需要真正训练
     },
     "simplenet": {
-        "backbone":   "wide_resnet50_2.tv_in1k",  # SimpleNet 要求 .tv 权重格式
+        "backbone":   "resnet18.tv_in1k",  # SimpleNet 要求 .tv 权重格式
         "layers":     ["layer2", "layer3"],
         "max_epochs": 100,    # 需要训练判别头
     },
     "rd": {
-        "backbone":   "wide_resnet50_2",
+        "backbone":   "resnet18",
         "layers":     ["layer1", "layer2", "layer3"],
         "max_epochs": 100,    # 需要训练解码器
     },
     "padim": {
-        "backbone":   "wide_resnet50_2",
-        "layers":     ["layer2", "layer3"],   # 用 2 层避免 OOM（layer1 空间分辨率大，特征量巨大）
+        "backbone":   "resnet18",
+        "layers":     ["layer2", "layer3"],   # 15GB 显存安全配置
         "max_epochs": 1,                       # Memory Bank 方法，不需要真正训练
-        "n_features": 150,                     # wrn50+2层 推荐 100~200（3层需 ≤100）
+        "n_features": 100,                     # resnet18 推荐 100 (wrn50=550)
     },
 }
 
@@ -373,7 +379,7 @@ def _apply_model_defaults(args: argparse.Namespace) -> None:
         args.layers = cfg["layers"]
     if args.max_epochs == 1 and args.model in ("simplenet", "rd"):
         args.max_epochs = cfg["max_epochs"]
-    # n_features 自动适配 (PaDiM: wrn50=550, resnet18=100)
+    # n_features 自动适配 (PaDiM: resnet18=100, wrn50=550)
     if args.model == "padim" and args.n_features is None:
         args.n_features = cfg.get("n_features")
     # input-size 跟随 image-size（RD 模型需要）
@@ -438,7 +444,7 @@ def _load_backbone_weights(args: argparse.Namespace, log: _StageLogger):
                     log.error(f"     当前 backbone : {args.backbone}")
                     log.error(f"     权重文件      : {weights_path.name}")
                     log.error(f"     尝试用 --backbone 指定与权重文件匹配的架构")
-                    log.error(f"     例: --model padim --backbone wide_resnet50_2 --weights-path {weights_path}")
+                    log.error(f"     例: --model padim --backbone resnet18 --weights-path {weights_path}")
                     sys.exit(1)
                 raise
             log.info(f"  ✅ 本地权重加载成功 (strict=False，允许部分键不匹配)")
@@ -558,8 +564,8 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--extensions", type=str, nargs="+",default=[".bmp", ".jpg", ".png"])
 
     # 数据加载
-    parser.add_argument("--train-batch-size", type=int, default=64)
-    parser.add_argument("--eval-batch-size", type=int, default=32)
+    parser.add_argument("--train-batch-size", type=int, default=32)
+    parser.add_argument("--eval-batch-size", type=int, default=16, help="评估批次大小（15GB显存建议≤8，避免阈值计算OOM）")
     parser.add_argument("--num-workers", type=int, default=4,help="数据加载进程数（NAS 盘建议 4~8，SSD 可设更高）")
     parser.add_argument("--pin-memory", action="store_true", default=True,help="锁页内存加速 CPU→GPU 数据传输")
     parser.add_argument("--seed", type=int, default=42)
@@ -567,7 +573,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--val-split-ratio", type=float, default=0.5)
 
     # 模型通用参数
-    parser.add_argument("--backbone", type=str, default="wide_resnet50_2",
+    parser.add_argument("--backbone", type=str, default="resnet18",
                         help="骨干网络名称（各模型有不同默认值，--model 切换时自动适配）")
     parser.add_argument("--layers", type=str, nargs="+",
                         default=["layer2", "layer3"],
@@ -597,7 +603,7 @@ def _parse_args() -> argparse.Namespace:
     
     # 权重加载选项 (Timm / MMDet 二选一)
     weight_group = parser.add_mutually_exclusive_group()
-    weight_group.add_argument("--weights-path", type=str, default=r'weights/wide_resnet50_2.pth',
+    weight_group.add_argument("--weights-path", type=str, default=r'weights/resnet18.pth',
                         help="[Timm本地] 本地权重路径。放到 weights/ 目录下。")
     weight_group.add_argument("--mmdet-weights", type=str, default=None,
                         help="[MMDetection] MMDetection 权重路径。若指定此项，--backbone 需改为 torchvision 名称 (如 resnet50)")
