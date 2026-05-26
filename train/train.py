@@ -182,6 +182,7 @@ def main(args: argparse.Namespace | None = None) -> None:
              f"({'特征建库' if args.max_epochs == 1 else '梯度训练'})")
     _use_fp16 = args.model in ("simplenet", "rd")
     log.info(f"  precision           : {'FP16 (混合精度)' if _use_fp16 else 'FP32 (Memory Bank 方法无需梯度)'}")
+    log.info(f"  vis_samples         : {args.vis_samples} ({'跳过' if args.vis_samples == 0 else '训练后随机采样'})")
 
     # ---- 预训练权重加载（返回 backbone_arg 或 None）----
     backbone_arg = _load_backbone_weights(args, log)
@@ -274,13 +275,32 @@ def main(args: argparse.Namespace | None = None) -> None:
     # ================================================================
     # 阶段 4：采样预测可视化
     # ================================================================
-    if ckpt_path and ckpt_path.is_file():
+    if ckpt_path and ckpt_path.is_file() and args.vis_samples > 0:
         log.stage("4. 采样预测可视化")
         _sample_and_predict(model, engine, ckpt_path, dataset_root, args.abnormal_dir,
-                            args.extensions, images_dir, log, seed=args.seed)
+                            args.extensions, images_dir, log, seed=args.seed,
+                            max_samples=args.vis_samples)
         log.done()
+    elif args.vis_samples == 0:
+        log.info("\n⏭️ 跳过采样预测 (--vis-samples=0，需要时跑 predict.py)")
     else:
         log.warning("\n跳过采样预测（无有效 checkpoint）")
+
+    # ================================================================
+    # 保存训练配置（供 predict.py 自适应读取）
+    # ================================================================
+    import json
+    _config_fields = [
+        "model", "backbone", "layers", "image_size", "input_size",
+        "mmdet_weights", "weights_path", "pre_trained",
+        "n_features", "coreset_sampling_ratio", "perlin_threshold",
+        "anomaly_map_mode", "image_sensitivity", "pixel_sensitivity",
+    ]
+    train_config = {f: getattr(args, f) for f in _config_fields}
+    config_path = results_root / "train_config.json"
+    with open(config_path, "w", encoding="utf-8") as _f:
+        json.dump(train_config, _f, indent=2, ensure_ascii=False)
+    log.info(f"  配置文件: {config_path}")
 
     # ================================================================
     # 总结
@@ -391,6 +411,14 @@ def _load_backbone_weights(args: argparse.Namespace, log: _StageLogger):
     """加载预训练权重，返回 backbone_arg (模型实例 / 字符串 / None)。"""
     backbone_arg = args.backbone
 
+    # ---- RD 模型不支持自定义权重注入（decoder 需要字符串查表）----
+    if args.model == "rd":
+        if args.mmdet_weights or (args.weights_path and Path(args.weights_path).is_file()):
+            log.warning(f"  ⚠ RD 不支持自定义权重，已忽略 --mmdet-weights/--weights-path")
+            log.warning(f"     将使用 timm 在线预训练的 {args.backbone}")
+        log.info(f"  预训练权重: RD 使用 timm 在线预训练 ({args.backbone})")
+        return backbone_arg
+
     if args.model == "simplenet":
         # SimpleNet 通过 timm 自动加载 .tv 权重，不支持自定义权重注入
         log.info(f"  预训练权重: SimpleNet 使用 timm .tv 格式 ({args.backbone})")
@@ -498,14 +526,11 @@ def _create_model(args, backbone_arg, images_dir: Path,
         )
 
     elif args.model == "rd":
-        input_size = tuple(args.input_size)
-        log.info(f"  input_size           : {input_size}")
         log.info(f"  anomaly_map_mode     : {args.anomaly_map_mode}")
         return ReverseDistillation(
             backbone=backbone_arg,
             layers=tuple(args.layers),
             pre_trained=use_pretrained,
-            input_size=input_size,
             anomaly_map_mode=args.anomaly_map_mode,
             **common_kwargs,
         )
@@ -603,8 +628,8 @@ def _parse_args() -> argparse.Namespace:
     
     # 权重加载选项 (Timm / MMDet 二选一)
     weight_group = parser.add_mutually_exclusive_group()
-    weight_group.add_argument("--weights-path", type=str, default=r'weights/resnet18.pth',
-                        help="[Timm本地] 本地权重路径。放到 weights/ 目录下。")
+    weight_group.add_argument("--weights-path", type=str, default=r'weights/timm/resnet18.pth',
+                        help="[Timm本地] 本地权重路径。放到 weights/timm/ 目录下。")
     weight_group.add_argument("--mmdet-weights", type=str, default=None,
                         help="[MMDetection] MMDetection 权重路径。若指定此项，--backbone 需改为 torchvision 名称 (如 resnet50)")
 
@@ -625,6 +650,8 @@ def _parse_args() -> argparse.Namespace:
                         action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--skip-test", action="store_true",
                         help="跳过测试阶段（显存不足时可用）")
+    parser.add_argument("--vis-samples", type=int, default=100,
+                        help="[阶段4] 训练后采样可视化数量（默认100张）。设0跳过，完整预测请用 predict.py")
 
     args = parser.parse_args()
 

@@ -95,6 +95,14 @@ def _load_backbone_weights(args: argparse.Namespace, log: logging.Logger):
     """
     backbone_arg = args.backbone
 
+    # ---- RD 模型不支持自定义权重注入（decoder 需要字符串查表）----
+    if args.model == "rd":
+        if args.mmdet_weights or (args.weights_path and Path(args.weights_path).is_file()):
+            log.warning(f"  ⚠ RD 不支持自定义权重注入（decoder 限制），已忽略")
+            log.warning(f"     将使用 timm 在线预训练的 {args.backbone}")
+        log.info(f"  预训练权重: RD 使用 timm 在线预训练 ({args.backbone})")
+        return backbone_arg
+
     if args.model == "simplenet":
         log.info(f"  预训练权重: SimpleNet 使用 timm .tv 格式 ({args.backbone})")
         return backbone_arg
@@ -146,6 +154,73 @@ def _load_backbone_weights(args: argparse.Namespace, log: logging.Logger):
     return backbone_arg
 
 
+def _auto_load_config(args: argparse.Namespace, log: logging.Logger) -> None:
+    """
+    从 train_dir/train_config.json 自动加载训练配置，覆盖 predict 默认值。
+    CLI 显式传入的参数优先级高于 config（用户手动指定则不覆盖）。
+    """
+    import json
+
+    train_dir = Path(args.train_dir)
+    config_path = train_dir / "train_config.json"
+
+    if not config_path.is_file():
+        log.warning(f"  ⚠ 未找到 {config_path.name}，使用 CLI 参数 / 默认值")
+        log.info("     提示：重新训练一次即可自动生成配置文件")
+        return
+
+    with open(config_path, "r", encoding="utf-8") as f:
+        config = json.load(f)
+
+    # 记录哪些 key 被覆盖了
+    _overridden = []
+    _skip_keys = {"model", "backbone", "layers", "image_size", "input_size",
+                  "mmdet_weights", "weights_path", "pre_trained",
+                  "n_features", "coreset_sampling_ratio", "perlin_threshold",
+                  "anomaly_map_mode"}
+
+    for key in _skip_keys:
+        if key not in config:
+            continue
+        config_val = config[key]
+        # CLI 默认值 → 用 config 覆盖；CLI 用户显式指定 → 保持不变
+        # 判断方式：对比当前 args 值与 parser 默认值是否相同
+
+        # 特殊处理：layers 是 list，默认 ["layer2","layer3"]
+        if key == "layers" and args.layers == ["layer2", "layer3"]:
+            args.layers = config_val
+            _overridden.append(key)
+        elif getattr(args, key, None) == _DEFAULTS.get(key):
+            setattr(args, key, config_val)
+            _overridden.append(key)
+
+    if _overridden:
+        log.info(f"  📋 从 train_config.json 自动加载:")
+        for k in _overridden:
+            v = config[k]
+            log.info(f"     --{k.replace('_', '-')} = {v}")
+    else:
+        log.info(f"  📋 已读取 {config_path.name}，所有参数与 CLI 一致")
+
+
+# predict.py 的 parser 默认值（用于判断用户是否显式指定）
+_DEFAULTS = {
+    "model": "patchcore",
+    "backbone": "resnet18",
+    "layers": ["layer2", "layer3"],
+    "image_sensitivity": 0.5,
+    "pixel_sensitivity": 0.5,
+    "coreset_sampling_ratio": 0.1,
+    "perlin_threshold": 0.2,
+    "n_features": None,
+    "anomaly_map_mode": "add",
+    "input_size": [256, 256],
+    "pre_trained": True,
+    "weights_path": r"weights/timm/resnet18.pth",
+    "mmdet_weights": None,
+}
+
+
 def main(args: argparse.Namespace | None = None) -> None:
     _add_src_to_path()
 
@@ -170,6 +245,9 @@ def main(args: argparse.Namespace | None = None) -> None:
     log.info("=" * 60)
     log.info(f"PREDICT  output: {results_root.resolve()}")
     log.info("=" * 60)
+
+    # ---- 从 train_dir 自动加载训练配置（自适应）----
+    _auto_load_config(args, log)
 
     # ---- 训练目录 & Checkpoint ----
     train_dir = Path(args.train_dir)
@@ -219,7 +297,6 @@ def main(args: argparse.Namespace | None = None) -> None:
             backbone=backbone_arg,
             layers=tuple(args.layers),
             pre_trained=use_pretrained,
-            input_size=tuple(args.input_size),
             anomaly_map_mode=args.anomaly_map_mode,
             **common_kwargs,
         )
@@ -320,12 +397,13 @@ def _parse_args() -> argparse.Namespace:
                         choices=["add", "multiply"], help="[RD] 异常图模式")
 
     # 支持 MMDetection 自定义权重推理
-    parser.add_argument("--mmdet-weights", action="store_true",
-                        help="若训练时使用了 mmdet 权重，请带上此 Flag")
+    parser.add_argument("--mmdet-weights", type=str, default=None,
+                        help="[MMDetection] MMDetection 权重路径。若训练时使用了此项，必须一致！")
 
-    # 预训练权重路径（与 train.py 保持一致，默认自动检测 weights/resnet18.pth）
-    parser.add_argument("--weights-path", type=str, default=r"weights/resnet18.pth",
-                        help="[Timm本地] 本地预训练权重路径。若文件存在则加载（与训练一致），不存在则跳过")
+    # 预训练权重路径
+    weight_group = parser.add_mutually_exclusive_group()
+    weight_group.add_argument("--weights-path", type=str, default=r"weights/timm/resnet18.pth",
+                        help="[Timm本地] 本地预训练权重路径。设空字符串''跳过")
 
     # 硬件
     parser.add_argument("--accelerator", type=str, default="gpu")
