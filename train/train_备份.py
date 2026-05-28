@@ -175,13 +175,8 @@ def main(args: argparse.Namespace | None = None) -> None:
         pixel_sensitivity=args.pixel_sensitivity,
     )
     log.info(f"  模型                : {args.model}")
-    if args.model == "anomaly_dino":
-        log.info(f"  encoder_name         : {args.encoder_name}")
-        log.info(f"  masking              : {args.masking}")
-        log.info(f"  coreset_subsampling  : {args.coreset_subsampling}")
-    else:
-        log.info(f"  backbone            : {args.backbone}")
-        log.info(f"  layers              : {args.layers}")
+    log.info(f"  backbone            : {args.backbone}")
+    log.info(f"  layers              : {args.layers}")
     log.info(f"  image_size          : {args.image_size}")
     log.info(f"  max_epochs          : {args.max_epochs} "
              f"({'特征建库' if args.max_epochs == 1 else '梯度训练'})")
@@ -302,12 +297,10 @@ def main(args: argparse.Namespace | None = None) -> None:
     import json
     _config_fields = [
         "model", "backbone", "layers", "image_size", "input_size",
-        "mmdet_weights", "weights_path", "dino_weights", "pre_trained",
+        "mmdet_weights", "weights_path", "pre_trained",
         "n_features", "coreset_sampling_ratio", "perlin_threshold",
         "anomaly_map_mode", "image_sensitivity", "pixel_sensitivity",
         "no_vis_test", "vis_samples",
-        # AnomalyDINO 特有
-        "encoder_name", "masking", "coreset_subsampling",
     ]
     train_config = {f: getattr(args, f) for f in _config_fields}
     config_path = results_root / "train_config.json"
@@ -391,6 +384,7 @@ def _sample_and_predict(model, engine, ckpt_path: Path, dataset_root: Path,
         try:
             engine.predict(
                 model=model,
+                ckpt_path=str(ckpt_path),
                 data_path=str(img_path),
                 return_predictions=False,
             )
@@ -433,30 +427,12 @@ _MODEL_DEFAULTS = {
         "max_epochs": 1,                       # Memory Bank 方法，不需要真正训练
         "n_features": 100,                     # resnet18 推荐 100 (wrn50=550)
     },
-    "anomaly_dino": {
-        "encoder_name":       "dinov2_vit_small_14",
-        "coreset_subsampling": True,
-        "masking":             False,
-        "image_size":          252,
-        "max_epochs":          1,              # Memory Bank 方法，不需要真正训练
-    },
 }
 
 
 def _apply_model_defaults(args: argparse.Namespace) -> None:
     """根据 --model 覆盖 backbone/layers/max_epochs/input-size 的默认值（仅当用户未手动指定时生效）。"""
     cfg = _MODEL_DEFAULTS[args.model]
-    if args.model == "anomaly_dino":
-        # AnomalyDINO 使用 DINO ViT encoder，不使用 CNN backbone/layers
-        if args.encoder_name == "dinov2_vit_small_14" and "encoder_name" in cfg:
-            args.encoder_name = cfg["encoder_name"]
-        if args.image_size == 256 and "image_size" in cfg:
-            args.image_size = cfg["image_size"]
-            args.input_size = [cfg["image_size"], cfg["image_size"]]
-        if not args.coreset_subsampling and "coreset_subsampling" in cfg:
-            args.coreset_subsampling = cfg["coreset_subsampling"]
-        return
-
     if args.backbone == "wide_resnet50_2" and args.model != "patchcore":
         args.backbone = cfg["backbone"]
     if args.layers == ["layer2", "layer3"] and args.model in ("rd", "padim"):
@@ -472,51 +448,13 @@ def _apply_model_defaults(args: argparse.Namespace) -> None:
 
 
 def _load_backbone_weights(args: argparse.Namespace, log: _StageLogger):
-    """加载预训练权重，返回 backbone_arg (模型实例 / 字符串 / None)。
-    
-    支持三种模式:
-      A) --mmdet-weights  : MMDetection 检测模型权重 (CNN)
-      B) --weights-path   : Timm 本地预训练权重 (CNN)
-      C) --dino-weights   : DINOv2/DINOv3 自监督权重 (ViT)
-    """
+    """加载预训练权重，返回 backbone_arg (模型实例 / 字符串 / None)。"""
     backbone_arg = args.backbone
-
-    # ---- 模式 C: DINOv2/DINOv3 权重 ----
-    if args.dino_weights:
-        dino_path = Path(args.dino_weights)
-        if not dino_path.is_file():
-            log.error(f"❌ 找不到 DINO 权重文件: {dino_path.resolve()}")
-            sys.exit(1)
-
-        # 从文件名推断 DINO 版本和架构
-        fname = dino_path.name.lower()
-        if "dinov2" in fname or fname.startswith("dinov2"):
-            dino_ver = "dinov2"
-        elif "dinov3" in fname or fname.startswith("dinov3"):
-            dino_ver = "dinov3"
-        else:
-            log.error(f"❌ 无法从文件名识别 DINO 版本: {fname} (需包含 dinov2 或 dinov3)")
-            sys.exit(1)
-
-        log.info(f"  DINO 权重           : {dino_path.resolve()}")
-        log.info(f"  DINO 版本           : {dino_ver}")
-        log.info(f"  Encoder 名称        : {args.encoder_name}")
-
-        # 返回 DINO 配置信息供 _create_model 使用
-        return {"type": "dino", "path": str(dino_path), "version": dino_ver,
-                "encoder_name": args.encoder_name}
-
-    # ---- AnomalyDINO 无自定义权重：使用官方在线下载 ----
-    if args.model == "anomaly_dino":
-        log.info(f"  预训练权重: DINOv2 官方在线下载 ({args.encoder_name})")
-        log.info(f"     (首次运行自动下载到 ~/.cache/anomalib/dinov2/)")
-        log.info(f"     如需使用本地权重，请加 --dino-weights <路径>")
-        return None  # 让 AnomalyDINO 自己通过 DinoV2Loader 下载
 
     # ---- RD 模型不支持自定义权重注入（decoder 需要字符串查表）----
     if args.model == "rd":
         if args.mmdet_weights or (args.weights_path and Path(args.weights_path).is_file()):
-            log.warning(f"  ⚠ RD 不支持自定义权重注入（decoder 限制），已忽略")
+            log.warning(f"  ⚠ RD 不支持自定义权重，已忽略 --mmdet-weights/--weights-path")
             log.warning(f"     将使用 timm 在线预训练的 {args.backbone}")
         log.info(f"  预训练权重: RD 使用 timm 在线预训练 ({args.backbone})")
         return backbone_arg
@@ -582,7 +520,7 @@ def _load_backbone_weights(args: argparse.Namespace, log: _StageLogger):
         else:
             log.warning(f"  ⚠ 权重文件不存在: {weights_path}，将使用 timm 在线下载")
 
-    # 模式 D: 在线下载 或 随机初始化
+    # 模式 C/D: 在线下载 或 随机初始化
     if args.pre_trained and not args.mmdet_weights:
         log.info("  预训练权重: 从 timm 在线下载 (ImageNet)")
     else:
@@ -600,12 +538,9 @@ def _create_model(args, backbone_arg, images_dir: Path,
     from anomalib.models.image.padim.lightning_model import Padim
     from anomalib.visualization.image.visualizer import ImageVisualizer
 
-    # ---- AnomalyDINO (DINOv2/DINOv3 ViT backbone) ----
-    if args.model == "anomaly_dino":
-        return _create_anomaly_dino(args, backbone_arg, images_dir, post_processor, log)
-
     use_pretrained = (args.weights_path is None and not args.mmdet_weights) and args.pre_trained
     # --no-vis-test: 显式传 visualizer=False → 模型内部不会创建 ImageVisualizer callback
+    #   否则模型用默认值 True → 自动创建 ImageVisualizer() → on_test_batch_end 保存图片时崩溃
     if images_dir is None:
         common_kwargs = dict(visualizer=False, post_processor=post_processor)
         log.info("  ImageVisualizer: 禁用（--no-vis-test，visualizer=False）")
@@ -658,381 +593,8 @@ def _create_model(args, backbone_arg, images_dir: Path,
         )
 
     else:
-        log.error(f"❌ 不支持的模型: {args.model} (可选: patchcore/simplenet/rd/padim/anomaly_dino)")
+        log.error(f"❌ 不支持的模型: {args.model} (可选: patchcore/simplenet/rd/padim)")
         sys.exit(1)
-
-
-def _create_anomaly_dino(args, dino_config, images_dir: Path,
-                          post_processor, log: _StageLogger):
-    """创建 AnomalyDINO 模型，支持自定义 DINOv2/DINOv3 权重注入。"""
-    from anomalib.models.image.anomaly_dino.lightning_model import AnomalyDINO
-    from anomalib.models.components.dinov2 import DinoV2Loader
-    from anomalib.visualization.image.visualizer import ImageVisualizer
-
-    encoder_name = args.encoder_name
-    masking = args.masking
-    coreset_subsampling = args.coreset_subsampling
-    sampling_ratio = args.coreset_sampling_ratio
-
-    log.info(f"  encoder_name         : {encoder_name}")
-    log.info(f"  masking              : {masking}")
-    log.info(f"  coreset_subsampling  : {coreset_subsampling}")
-    log.info(f"  sampling_ratio       : {sampling_ratio}")
-
-    vis_kwarg = False if images_dir is None else ImageVisualizer(output_dir=images_dir)
-    if images_dir is None:
-        log.info("  ImageVisualizer: 禁用（--no-vis-test）")
-
-    # ---- 自定义 DINO 权重注入 ----
-    if isinstance(dino_config, dict) and dino_config.get("type") == "dino":
-        dino_path = Path(dino_config["path"])
-        dino_ver = dino_config["version"]
-
-        try:
-            feature_encoder = _load_dino_encoder(encoder_name, dino_path, dino_ver, log)
-        except Exception as e:
-            log.error(f"❌ DINO 权重加载失败: {e}")
-            import traceback as tb
-            log.error(tb.format_exc())
-            sys.exit(1)
-
-        log.info(f"  ✅ 自定义 DINO 权重加载成功！")
-        # AnomalyDINOModel 内部检查 encoder_name 必须以 'dinov2' 开头，
-        # 但我们马上会替换掉 feature_encoder，所以传一个兼容的 dummy 名称
-        _dummy_name = "dinov2_vit_small_14"
-        model = AnomalyDINO(
-            num_neighbours=1,
-            encoder_name=_dummy_name,  # dummy: 仅用于通过内部校验
-            masking=masking,
-            coreset_subsampling=False,  # 我们手动控制采样比例
-            sampling_ratio=sampling_ratio,
-            visualizer=vis_kwarg,
-            post_processor=post_processor,
-        )
-        # 替换内部的 feature_encoder 为我们加载了自定义权重的版本
-        model.model.feature_encoder = feature_encoder
-    else:
-        # 无自定义权重，让 AnomalyDINO 自己通过 DinoV2Loader 在线下载
-        log.info(f"  使用 DINOv2 官方权重（在线下载或缓存）")
-        model = AnomalyDINO(
-            num_neighbours=1,
-            encoder_name=encoder_name,
-            masking=masking,
-            coreset_subsampling=coreset_subsampling,
-            sampling_ratio=sampling_ratio,
-            visualizer=vis_kwarg,
-            post_processor=post_processor,
-        )
-
-    # ===================================================================
-    #  AnomalyDINO Memory Bank 建库安全网
-    #
-    #  根因: feature_encoder.eval() -> 整体被 Lightning 设为 eval (199 modules)
-    #        -> forward() self.training=False -> 特征不进 embedding_store
-    #  方案: types.MethodType 替换三个方法，绕过 self.training
-    # ===================================================================
-    import types as _types
-    import torch.nn.functional as _F
-    import torch as _T
-
-    _tm = model.model  # 闭包引用 AnomalyDINOModel 实例
-
-    def _new_training_step(self, batch, *args, **kwargs):
-        """直接提取特征到 embedding_store，不依赖 self.training。"""
-        del args, kwargs
-        if not _tm.training:
-            _tm.train()
-            print("[SAFETY-NET] forced tm.train()", flush=True)
-
-        img = batch["image"] if isinstance(batch, dict) else batch.image
-
-        input_tensor = img.type(_tm.memory_bank.dtype)
-        _, _, h, w = input_tensor.shape
-        ps = _tm.feature_encoder.patch_size
-        ch, cw = h % ps, w % ps
-        if ch > 0 or cw > 0:
-            input_tensor = input_tensor[:, :, ch//2:h-ch+ch//2, cw//2:w-cw+cw//2]
-        grid = ((h-ch)//ps, (w-cw)//ps)
-        dev = input_tensor.device
-
-        with _T.inference_mode():
-            feats = _tm.feature_encoder.get_intermediate_layers(input_tensor, n=1)[0]
-
-        # 保存全量特征作为 masking 回退
-        feats_full = feats.clone() if _tm.masking else None
-
-        if _tm.masking:
-            import numpy as _np
-            masks_np = type(_tm).compute_background_masks(feats.detach().cpu().numpy(), grid)
-            masks = _T.from_numpy(masks_np).to(dev)
-        else:
-            masks = _T.ones(feats.shape[:2], dtype=_T.bool, device=dev)
-
-        feats = feats[masks]
-
-        # 回退: 如果 masking 把所有 patch 都滤掉了，降级为使用全量特征
-        if feats.size(0) == 0 and feats_full is not None:
-            print(f"[SAFETY-NET] MASKING filtered ALL patches! Falling back to full features.", flush=True)
-            feats = feats_full.reshape(-1, feats_full.shape[-1])  # [B, N, D] → [B*N, D]
-
-        feats = _F.normalize(feats, p=2, dim=1)
-        _tm.embedding_store.append(feats)
-
-        print(f"[SAFETY-NET] store={len(_tm.embedding_store)} last={feats.shape}", flush=True)
-        return _T.tensor(0.0, requires_grad=True, device=input_tensor.device)
-
-    model.training_step = _types.MethodType(_new_training_step, model)
-
-    def _new_epoch_end(self):
-        ne = len(_tm.embedding_store); mbn = _tm.memory_bank.numel()
-        print(f"[SAFETY-NET] epoch_end: store={ne} bank_n={mbn}", flush=True)
-        if ne > 0 and mbn == 0:
-            print(f"[SAFETY-NET] fit() with {ne} chunks...", flush=True)
-            _tm.fit()
-            print(f"[SAFETY-NET] fit() OK: {_tm.memory_bank.shape}", flush=True)
-        elif ne == 0:
-            print("[SAFETY-NET] ERROR empty store!", flush=True)
-
-    model.on_train_epoch_end = _types.MethodType(_new_epoch_end, model)
-
-    def _new_val_start(self):
-        if _tm.memory_bank.numel() == 0:
-            ne = len(_tm.embedding_store)
-            if ne > 0:
-                print(f"[SAFETY-NET] EMERGENCY fit: {ne} chunks", flush=True); _tm.fit()
-            else:
-                print("[SAFETY-NET] FATAL no features!", flush=True)
-
-    model.on_validation_start = _types.MethodType(_new_val_start, model)
-    print("[SAFETY-NET] hooks OK", flush=True)
-    return model
-    import logging as _logging
-    _mb_log = _logging.getLogger(__name__)
-
-    # ---- 1. 包装 training_step：强制 train 模式 ----
-    _orig_training_step = model.training_step
-
-    def _safe_training_step(self, batch, *args, **kwargs):
-        """确保 AnomalyDINOModel 在训练步骤中处于 train 模式。"""
-        torch_model = self.model
-        # 显式设为 train 模式（解决 self.training=False 的问题）
-        was_training = torch_model.training
-        if not was_training:
-            torch_model.train()
-            _mb_log.warning(
-                "[安全网] torch_model.training=%s, 已强制设为 train()",
-                was_training,
-            )
-        try:
-            result = _orig_training_step(self, batch, *args, **kwargs)
-            # 诊断: 打印收集状态
-            n_stored = len(torch_model.embedding_store)
-            if n_stored > 0:
-                last_shape = torch_model.embedding_store[-1].shape
-                _mb_log.debug("[安全网] training_step 完成, 累计 %d 个特征块 (最新 %s)", n_stored, last_shape)
-            else:
-                _mb_log.warning(
-                    "[安全网] ⚠️ training_step 执行后 embedding_store 仍为空! "
-                    "self.training=%s, feature_encoder=%s",
-                    torch_model.training,
-                    type(torch_model.feature_encoder).__name__,
-                )
-            return result
-        finally:
-            pass  # 不恢复原模式——在整个训练期间保持 train
-
-    model.training_step = _safe_training_step.__get__(model, type(model))
-
-    # ---- 2. 包装 on_train_epoch_end：训练结束后立即建库 ----
-    __orig_train_epoch_end = getattr(model, "on_train_epoch_end", None)
-
-    def _safe_on_train_epoch_end(self):
-        """训练 epoch 结束后立即构建 Memory Bank。"""
-        torch_model = self.model
-        n_embed = len(torch_model.embedding_store)
-        mb_size = torch_model.memory_bank.numel()
-
-        _mb_log.info(
-            "[安全网] on_train_epoch_end: embedding_store=%d, memory_bank=%d",
-            n_embed, mb_size,
-        )
-
-        if n_embed > 0 and mb_size == 0:
-            # 有待建库的特征，立即 fit
-            _mb_log.info("[安全网] 发现 %d 个未建库特征块，立即 fit()", n_embed)
-            self.fit()
-            _mb_log.info(
-                "[安全网] fit() 完成, memory_bank size=%s",
-                torch_model.memory_bank.shape,
-            )
-        elif mb_size > 0:
-            _mb_log.info("[安全网] Memory Bank 已就绪 (size=%s), 跳过", torch_model.memory_bank.shape)
-        elif n_embed == 0:
-            _mb_log.error(
-                "[安全网] ❌ 训练结束但 embedding_store 为空! "
-                "特征可能未在 training_step 中正确收集。",
-            )
-
-        if _orig_train_epoch_end is not None:
-            _orig_train_epoch_end()
-
-    model.on_train_epoch_end = _safe_on_train_epoch_end.__get__(model, type(model))
-
-    # ---- 3. 包装 on_validation_start：验证前最后防线 ----
-    _orig_val_start = getattr(model, "on_validation_start", None)
-
-    def _safe_on_validation_start(self):
-        """验证开始前确保 Memory Bank 可用。"""
-        torch_model = self.model
-        if torch_model.memory_bank.numel() == 0:
-            n_embed = len(torch_model.embedding_store)
-            if n_embed > 0:
-                _mb_log.info(
-                    "[安全网] 验证前紧急建库: %d 个特征块", n_embed,
-                )
-                self.fit()
-            else:
-                _mb_log.error(
-                    "[安全网] ❌ 验证前 Memory Bank 为空且无待建库特征! "
-                    "推理将失败。",
-                )
-
-        if _orig_val_start is not None:
-            _orig_val_start()
-
-    model.on_validation_start = _safe_on_validation_start.__get__(model, type(model))
-
-    _mb_log.info("✅ AnomalyDINO Memory Bank 安全网已安装 (3 hooks)")
-    return model
-
-
-def _load_dino_encoder(encoder_name: str, weight_path: Path, dino_ver: str,
-                       log: _StageLogger):
-    """加载 DINOv2/DINOv3 编码器模型并灌入本地权重。
-
-    策略：
-      - DINOv2: 通过 DinoV2Loader 创建标准 ViT，然后覆盖加载本地权重
-      - DINOv3: 使用 DINOv3 项目自带的模型定义 (DinoVisionTransformer)，
-        架构与 DINOv2 完全不同 (RoPE / storage_tokens / bias_mask)，不能混用
-    """
-    log.info(f"  加载 DINO{'' if dino_ver == 'dinov2' else '3'} 权重: {weight_path.name}")
-
-    if dino_ver == "dinov3":
-        return _load_dinov3_encoder(encoder_name, weight_path, log)
-
-    # ---- DINOv2 路径 ----
-    from anomalib.models.components.dinov2 import DinoV2Loader
-
-    # 只用 create_model() 创建空架构，避免 from_name() 自动下载官方权重
-    loader = DinoV2Loader()
-    model_type, architecture, patch_size = loader._parse_name(encoder_name)
-    try:
-        encoder = loader.create_model(model_type, architecture, patch_size)
-        log.info(f"  DINOv2 空架构创建成功: {model_type} / {architecture} / p{patch_size}")
-    except (ValueError, KeyError) as e:
-        log.warning(f"  DinoV2Loader 不支持 '{encoder_name}' ({e})，尝试手动构建...")
-        encoder = _build_fallback_dino_encoder(encoder_name, log)
-
-    state_dict = torch.load(weight_path, map_location="cpu", weights_only=True)
-
-    missing, unexpected = [], []
-    try:
-        result = encoder.load_state_dict(state_dict, strict=True)
-        missing, unexpected = result.missing_keys, result.unexpected_keys
-    except RuntimeError:
-        log.warning(f"  ⚠ strict 匹配失败，使用 strict=False")
-        result = encoder.load_state_dict(state_dict, strict=False)
-        missing, unexpected = result.missing_keys, result.unexpected_keys
-
-    if missing:
-        log.info(f"     缺失键: {len(missing)} 个 (首次出现: {missing[:3]})")
-    if unexpected:
-        log.info(f"     多余键: {len(unexpected)} 个")
-
-    matched = len(state_dict) - len(missing)
-    log.info(f"     匹配 Tensor: {matched}/{len(state_dict)}")
-    encoder.eval()
-    return encoder
-
-
-def _load_dinov3_encoder(encoder_name: str, weight_path: Path, log: _StageLogger):
-    """使用 DINOv3 项目自身的模型定义加载 DINOv3 编码器。
-
-    DINOv3 的架构与 DINOv2 完全不同:
-      - RoPE (旋转位置编码) 替代 learnable pos_embed
-      - storage_tokens / mask_token / bias_mask 等新组件
-      - LayerNormBF16 等特殊层
-    必须使用 DinoVisionTransformer 类，不能灌入 DINOv2 模型。
-    """
-    dinov3_root = Path(r"Z:\14-调试数据\lxm\Projects\DINOv3")
-
-    # encoder_name 即为 DINOv3 hub 函数名: dinov3_vitb16, dinov3_vits16plus 等
-    hub_func_name = encoder_name
-
-    import sys
-    dinov3_src = str(dinov3_root)
-    if dinov3_src not in sys.path:
-        sys.path.insert(0, dinov3_src)
-
-    log.info(f"  DINOv3 hub 函数: {hub_func_name}")
-    log.info(f"  DINOv3 项目路径: {dinov3_root}")
-
-    # 动态导入对应的 hub 工厂函数 (如 dinov3_vitb16 / dinov3_vits16)
-    from dinov3.hub import backbones as hub_module
-    hub_fn = getattr(hub_module, hub_func_name, None)
-    if hub_fn is None:
-        available = [k for k in dir(hub_module) if k.startswith("dinov3_")]
-        raise ValueError(
-            f"DINOv3 hub 中没有 '{hub_func_name}'。可用: {available}"
-        )
-
-    # 调用工厂函数: pretrained=False 先建空壳, weights=本地路径加载权重
-    encoder = hub_fn(pretrained=False, weights=str(weight_path))
-    log.info(f"  ✅ DINOv3 编码器加载成功！")
-    encoder.eval()
-    return encoder
-
-
-def _build_fallback_dino_encoder(encoder_name: str, log: _StageLogger):
-    """当 DinoV2Loader 不支持某 encoder_name 时，回退到手动构建 ViT。
-
-    支持的命名格式:
-      - 标准格式: dinov2/dinov3 + _vit_ + {small/base/large} + _{patch_size}
-        例: dinov2_vit_small_14 / dinov3_vit_large_14
-      - 紧凑格式: dinov2/dinov3 + _vits/vitb/vitl + {patch_size}
-        例: dinov3_vitb16 / dinov3_vits16plus / dinov2_vits14
-    """
-    from anomalib.models.components.dinov2 import vision_transformer as dinov2_models
-
-    # 映射到 DinoV2Loader 的 MODEL_CONFIGS 架构标识
-    arch_map = {
-        "s": "small",   "small": "small",
-        "b": "base",    "base": "base",
-        "l": "large",   "large": "large",
-    }
-
-    # 先用正则提取: (vit)(s|b|l|small|base|large)(\d*)(plus)?
-    import re
-    # 匹配 vits16, vitb16, vitl16, vits16plus, vit_small, vit_base 等
-    m = re.search(r'vit([sbl]|small|base|large)(\d+)(plus)?', encoder_name, re.IGNORECASE)
-    if not m:
-        raise ValueError(f"无法从 '{encoder_name}' 中解析出 ViT 架构大小 (s/b/l) 和 patch_size")
-
-    arch_short = m.group(1).lower()
-    patch_size = int(m.group(2))
-    architecture = arch_map.get(arch_short)
-    if not architecture:
-        raise ValueError(f"未知的 ViT 架构标识: '{arch_short}'")
-
-    # 查找构造函数
-    ctor_name = f"vit_{architecture}"
-    ctor = getattr(dinov2_models, ctor_name, None)
-    if ctor is None:
-        raise ValueError(f"dinov2_models 中没有 {ctor_name} (可用: vit_small, vit_base, vit_large)")
-
-    log.info(f"  手动构建: {ctor_name}(patch_size={patch_size}) [从 '{encoder_name}' 解析]")
-    model = ctor(patch_size=patch_size)
-    return model
 
 
 def _parse_args() -> argparse.Namespace:
@@ -1062,8 +624,8 @@ def _parse_args() -> argparse.Namespace:
 
     # ---- 模型选择 ----
     parser.add_argument("--model", type=str, default="patchcore",
-                        choices=["patchcore", "simplenet", "rd", "padim", "anomaly_dino"],
-                        help="模型选择: patchcore / simplenet(SimpleNet) / rd(ReverseDistillation) / padim / anomaly_dino(DINOv2)")
+                        choices=["patchcore", "simplenet", "rd", "padim"],
+                        help="模型选择: patchcore / simplenet(SimpleNet) / rd(ReverseDistillation) / padim")
 
     # 数据集
     parser.add_argument("--dataset-root", type=str,default=r"Z:\14-调试数据\lxm\Dataset\Anomalib\TB")
@@ -1110,22 +672,12 @@ def _parse_args() -> argparse.Namespace:
                         choices=["add", "multiply"],
                         help="[RD] 异常图生成模式: add / multiply")
     
-    # 权重加载选项 (Timm / MMDet / DINO 三选一)
+    # 权重加载选项 (Timm / MMDet 二选一)
     weight_group = parser.add_mutually_exclusive_group()
     weight_group.add_argument("--weights-path", type=str, default=r'weights/timm/resnet18.pth',
                         help="[Timm本地] 本地权重路径。放到 weights/timm/ 目录下。")
     weight_group.add_argument("--mmdet-weights", type=str, default=None,
                         help="[MMDetection] MMDetection 权重路径。若指定此项，--backbone 需改为 torchvision 名称 (如 resnet50)")
-    weight_group.add_argument("--dino-weights", type=str, default=None,
-                        help="[DINOv2/DINOv3] DINO 预训练权重 .pth 路径。配合 --model anomaly_dino 使用。")
-
-    # DINO 特有参数 (anomaly_dino 模型专用)
-    parser.add_argument("--encoder-name", type=str, default="dinov2_vit_small_14",
-                        help="[AnomalyDINO] DINO 编码器名称 (dinov2_vit_small_14 / dinov2_vit_base_14 / dinov3_vits16 等)")
-    parser.add_argument("--masking", action=argparse.BooleanOptionalAction, default=False,
-                        help="[AnomalyDINO] 是否启用 PCA 掩码抑制背景特征")
-    parser.add_argument("--coreset-subsampling", action=argparse.BooleanOptionalAction, default=True,
-                        help="[AnomalyDINO] 是否启用 coreset 降采样减少显存")
 
     # 阈值
     parser.add_argument("--image-sensitivity", type=float, default=0.5,
@@ -1161,48 +713,4 @@ if __name__ == "__main__":
     main()
 
 
-
-
-# python train/train.py 
-#   --exp-name train_mmdet_R50_patchcore 
-#   --model patchcore 
-#   --backbone resnet50 
-#   --layers layer2 layer3 
-#   --mmdet-weights weights\mmdet\TB_R50_20260520.pth 
-#   --coreset-sampling-ratio 0.5 
-#   --pixel-sensitivity 0.5 
-#   --no-vis-test --vis-samples 100
-
-
-
-
-# python train/train.py 
-#   --exp-name train_timm_R18_patchcore 
-#   --model patchcore 
-#   --backbone resnet18 
-#   --layers layer2 layer3 
-#   --weights-path weights\timm\resnet18.pth 
-#   --coreset-sampling-ratio 0.1 
-#   --pixel-sensitivity 0.7 
-#   --no-vis-test --vis-samples 100
-
-
-# python train/train.py 
-#   --exp-name train_dinov2_vits14 
-#   --model anomaly_dino 
-#   --dino-weights weights\dino\dinov2_vits14_pretrain.pth 
-#   --encoder-name dinov2_vit_small_14 
-#   --masking --no-coreset-subsampling 
-#   --image-size 252 
-#   --no-vis-test --vis-samples 100
-
-
-
-# python train/train.py 
-#   --exp-name train_dinov3_vitb16 
-#   --model anomaly_dino 
-#   --dino-weights Z:\14-调试数据\lxm\Projects\DINOv3\pretrain_models\dinov3\dinov3_vitb16_pretrain_lvd1689m-73cec8be.pth 
-#   --encoder-name dinov3_vitb16 
-#   --masking --coreset-subsampling 
-#   --image-size 252 
-#   --no-vis-test --vis-samples 100
+# python train/train.py --exp-name train_mmdet_R50_patchcore_layer23_ps0.5 --mmdet-weights weights\mmdet\TB_R50_20260520.pth --model patchcore  --backbone resnet50 --layers layer2 layer3 --pixel-sensitivity 0.5 --skip-test --vis-samples 100
