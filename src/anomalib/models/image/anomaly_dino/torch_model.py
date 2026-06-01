@@ -115,6 +115,7 @@ class AnomalyDINOModel(DynamicBufferMixin, nn.Module):
         """Extract patch-level feature embeddings from the last transformer layer.
 
         Returns flattened patch tokens excluding CLS and register tokens.
+        Uses reshape=True so DINO internally handles correct (W,H)->(H,W) token ordering.
 
         Args:
             image_tensor (torch.Tensor): Input image tensor of shape ``(B, 3, H, W)``.
@@ -124,7 +125,11 @@ class AnomalyDINOModel(DynamicBufferMixin, nn.Module):
             where ``N`` is the number of patches and ``D`` the feature dimension.
         """
         with torch.inference_mode():
-            return self.feature_encoder.get_intermediate_layers(image_tensor, n=1)[0]
+            # Use reshape=True: DINO internally reshapes as (W,H) then permutes to (D,H,W)
+            # This correctly handles the non-standard token ordering
+            feat = self.feature_encoder.get_intermediate_layers(image_tensor, n=1, reshape=True)[0]
+            # feat shape: (B, D, H_patches, W_patches) → flatten to (B, N, D)
+            return feat.flatten(2).transpose(1, 2)
 
     @staticmethod
     def compute_background_masks(

@@ -697,20 +697,23 @@ def _create_anomaly_dino(args, dino_config, images_dir: Path,
             sys.exit(1)
 
         log.info(f"  ✅ 自定义 DINO 权重加载成功！")
-        # AnomalyDINOModel 内部检查 encoder_name 必须以 'dinov2' 开头，
-        # 但我们马上会替换掉 feature_encoder，所以传一个兼容的 dummy 名称
-        _dummy_name = "dinov2_vit_small_14"
-        model = AnomalyDINO(
-            num_neighbours=1,
-            encoder_name=_dummy_name,  # dummy: 仅用于通过内部校验
-            masking=masking,
-            coreset_subsampling=False,  # 我们手动控制采样比例
-            sampling_ratio=sampling_ratio,
-            visualizer=vis_kwarg,
-            post_processor=post_processor,
-        )
-        # 替换内部的 feature_encoder 为我们加载了自定义权重的版本
-        model.model.feature_encoder = feature_encoder
+        # 临时替换 DinoV2Loader.load，返回已加载好的 encoder，阻止 AnomalyDINO 内部再次下载
+        _original_load = DinoV2Loader.load
+        def _fake_load(self, model_name):
+            return feature_encoder
+        DinoV2Loader.load = _fake_load
+        try:
+            model = AnomalyDINO(
+                num_neighbours=1,
+                encoder_name=encoder_name,
+                masking=masking,
+                coreset_subsampling=coreset_subsampling,
+                sampling_ratio=sampling_ratio,
+                visualizer=vis_kwarg,
+                post_processor=post_processor,
+            )
+        finally:
+            DinoV2Loader.load = _original_load
     else:
         # 无自定义权重，让 AnomalyDINO 自己通过 DinoV2Loader 在线下载
         log.info(f"  使用 DINOv2 官方权重（在线下载或缓存）")
